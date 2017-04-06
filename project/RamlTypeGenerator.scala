@@ -229,53 +229,82 @@ object RamlTypeGenerator {
     }
   }
 
-  sealed trait Constraint {
+  sealed trait Constraint[C] { self =>
+    val name: String
+    val constraint: C
+    val constraintToValue: C => Tree = { (c: C) => LIT(c) } // decent assumption for built-ins, probably not much else
+
+    /** false indicates custom, non-play constraint implementations that we've implemented as part of this generator */
+    val builtIn: Boolean
+
+    /** @return a code gen expression that represents a playJS reads validation */
     def validate(): Tree
+
+    /** a code gen expression for a field that represents the constraint limit */
+    val limitField: Option[Tree] = None
+
+    /** decorate this constraint with a `limitField` implementation */
+    def copyWith(lf: Option[Tree] = None): Constraint[C]
+
+    def withFieldLimit(f: FieldT): Constraint[C] = {
+      val fieldName = scalaFieldName(underscoreToCamel(camelify(s"constraint_${f.rawName}_${name.toUpperCase}".replace("-", "_"))))
+      val limit = (VAL(fieldName) := constraintToValue(constraint))
+      copyWith(Option(limit))
+    }
   }
 
   object Constraint {
-    /** custom, non-play constraint implementations that we've implemented as part of this generator */
-    sealed trait RamlConstraint extends Constraint
 
-    object RamlConstraint {
-      def apply(f: => Tree): RamlConstraint = new RamlConstraint {
-        override def validate(): Tree = f
-      }
+    // built-in playJS validators
+
+    def MaxLength(len: Integer) = Constraint("maxLength", len, builtIn = true) { REF(_) APPLYTYPE StringClass APPLY(_) }
+    def MinLength(len: Integer) = Constraint("minLength", len, builtIn = true) { REF(_) APPLYTYPE StringClass APPLY(_) }
+
+    def Pattern(p: String) = Constraint("pattern", p, builtIn = true, (c: String) => LIT(c) DOT "r") { REF(_) APPLY(_) }
+
+    def MaxItems(len: Integer, t: Type) = Constraint("maxLength", len, builtIn = true) { REF(_) APPLYTYPE t APPLY(_) }
+    def MinItems(len: Integer, t: Type) = Constraint("minLength", len, builtIn = true) { REF(_) APPLYTYPE t APPLY(_) }
+
+    def Max(v: Number, t: Type) = Constraint("max", v, builtIn = true) { REF(_) APPLYTYPE t APPLY(_) }
+    def Min(v: Number, t: Type) = Constraint("min", v, builtIn = true) { REF(_) APPLYTYPE t APPLY(_) }
+
+    // custom validator implementations follow
+
+    def KeyPattern(p: String, mapValType: Type) =
+      Constraint("keyPattern", p, builtIn = false, (c: String) => LIT(c) DOT "r") { REF(_) APPLYTYPE mapValType APPLY(_) }
+
+    case class BasicConstraint[C](
+      override val name: String,
+      override val constraint: C,
+      override val constraintToValue: C => Tree,
+      val validateFunc: (String, Tree) => Tree,
+      override val builtIn: Boolean,
+      override val limitField: Option[Tree] = None) extends Constraint[C] {
+      override def validate(): Tree = validateFunc(name, constraintToValue(constraint))
+      override def copyWith(lf: Option[Tree] = limitField): Constraint[C] = copy(limitField = lf)
     }
 
-    def MaxLength(len: Integer) = Constraint { REF("maxLength") APPLYTYPE StringClass APPLY(LIT(len)) }
-    def MinLength(len: Integer) = Constraint { REF("minLength") APPLYTYPE StringClass APPLY(LIT(len)) }
-    def Pattern(p: String) = Constraint { REF("pattern") APPLY(LIT(p) DOT "r") }
-    def KeyPattern(p: String, t: Type) = RamlConstraint { REF("keyPattern") APPLYTYPE t APPLY(LIT(p) DOT "r") }
+    def apply[C](n: String, c: C, builtIn: Boolean, c2v: C => Tree = { (c: C) => LIT(c) })(f: (String, Tree) => Tree): Constraint[C] =
+      new BasicConstraint(n, c, c2v, f, builtIn)
 
-    def MaxItems(len: Integer, t: Type) = Constraint { REF("maxLength") APPLYTYPE t APPLY(LIT(len)) }
-    def MinItems(len: Integer, t: Type) = Constraint { REF("minLength") APPLYTYPE t APPLY(LIT(len)) }
-
-    def Max(v: Number, t: Type) = Constraint { REF("max") APPLYTYPE t APPLY(LIT(v)) }
-    def Min(v: Number, t: Type) = Constraint { REF("min") APPLYTYPE t APPLY(LIT(v)) }
-
-    def apply(f: => Tree): Constraint = new Constraint {
-      override def validate(): Tree = f
-    }
-
-    implicit class Constraints(val c: Seq[Constraint]) extends AnyVal {
+    implicit class Constraints(val c: Seq[Constraint[_]]) extends AnyVal {
       def validate(exp: Tree): Tree = {
         if (c.isEmpty) {
           exp
         } else {
           @tailrec
-          def buildChain(constraints: List[ Constraint ], chain: Tree): Tree = constraints match {
+          def buildChain(constraints: List[Constraint[_]], chain: Tree): Tree = constraints match {
             case Nil => chain
             case c :: rs => buildChain(rs, chain INFIX("keepAnd", c.validate()))
           }
 
-          exp APPLY buildChain(c.tail.to[ List ], c.head.validate())
+          exp APPLY buildChain(c.tail.to[List], c.head.validate())
         }
       }
 
     }
 
-    implicit class AllConstraints(val c: Seq[Seq[Constraint]]) extends AnyVal {
+    implicit class AllConstraints(val c: Seq[Seq[Constraint[_]]]) extends AnyVal {
       def requiredImports: Seq[Tree] = {
         val flattened = c.flatten
         if (flattened.isEmpty) {
@@ -284,16 +313,14 @@ object RamlTypeGenerator {
           Seq(
             Option(IMPORT(PlayReads DOT "_")),
             if (c.exists(_.size > 1)) Option(IMPORT("play.api.libs.functional.syntax._")) else None,
-            flattened.collectFirst {
-              case _: RamlConstraint => IMPORT("RamlConstraints._")
-            }
+            flattened.find(!_.builtIn).map(_ => IMPORT("RamlConstraints._"))
           )
         }.flatten
       }
     }
   }
 
-  case class FieldT(rawName: String, `type`: Type, comments: Seq[String], constraints: Seq[Constraint], required: Boolean,
+  case class FieldT(rawName: String, `type`: Type, comments: Seq[String], constraints: Seq[Constraint[_]], required: Boolean,
                     default: Option[String], repeated: Boolean = false, forceOptional: Boolean = false, omitEmpty: Boolean = false) {
 
     val name = scalaFieldName(rawName)
@@ -524,7 +551,9 @@ object RamlTypeGenerator {
 
       val obj = if (childTypes.isEmpty) {
         (OBJECTDEF(name)) := BLOCK(
-          playFormat ++ defaultFields ++ defaultInstance
+          playFormat ++ defaultFields ++ defaultInstance ++ fields.flatMap { f =>
+            f.constraints.flatMap(_.withFieldLimit(f).limitField)
+          }
         )
       } else if (discriminator.isDefined) {
         val childDiscriminators: Map[String, ObjectT] = childTypes.map(ct => ct.discriminatorValue.getOrElse(ct.name) -> ct)(collection.breakOut)
@@ -668,7 +697,7 @@ object RamlTypeGenerator {
 
   def buildTypes(typeTable: Map[String, Symbol], allTypes: Set[TypeDeclaration]): Set[GeneratedClass] = {
     @tailrec def buildTypes(types: Set[TypeDeclaration], results: Set[GeneratedClass] = Set.empty[GeneratedClass]): Set[GeneratedClass] = {
-      def buildConstraints(field: TypeDeclaration, fieldType: Type): Seq[Constraint] = {
+      def buildConstraints(field: TypeDeclaration, fieldType: Type): Seq[Constraint[_]] = {
         Option(field).collect {
           case s: StringTypeDeclaration =>
             Seq(
@@ -699,7 +728,6 @@ object RamlTypeGenerator {
             val pattern = o.properties.last.name()
             val valueType = typeTable(o.properties.last.`type`())
             if(pattern != "/.*/" && pattern != "/^.*$/") Seq(Constraint.KeyPattern(pattern, valueType)) else Nil
-
         }.getOrElse(Nil)
       }
       def createField(fieldOwner: String, field: TypeDeclaration): FieldT = {
